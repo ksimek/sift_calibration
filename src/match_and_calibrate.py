@@ -19,6 +19,7 @@ def main():
     parser.add_argument('--num_iterations', nargs='?', type=int, default=0.6, help='number of iterations of match & homography re-estimation (2-3 is usually good)')
     parser.add_argument('--lowe_threshold', nargs='?', type=float, default=0.6, help='Use David Lowe\'s ratio criterion for pruning bad matches')
     parser.add_argument('--homography_threshold', nargs='?', type=float, default=0, help='fit a homography to matches and prune by this reprojection error threshold (zero ignores)')
+    parser.add_argument('--H_det_threshold', nargs='?', type=float, default=0, help='ignore frame if fitted homography has too small of a determinant.')
     parser.add_argument('--f_threshold', nargs='?', type=float, default=2, help='fit a fundamental matrix to matches and prune by this error threshold (zero ignores)')
     parser.add_argument('--min_matches', nargs='?', type=int, default=25, help='Minimum number of matches in a frame to be accepted into calibration set')
 
@@ -67,13 +68,16 @@ def main():
                 continue
             filtered_matches = matches;
             if args.homography_threshold > 0:
-                filtered_matches = feat.filter_matches_by_homography(
+                [filtered_matches, H] = feat.filter_matches_by_homography(
                         pattern_kp_mat,
                         fixed_kp_mat,
                         filtered_matches,
                         args.homography_threshold)
+                det_H = np.linalg.det(H)
+                if args.H_det_threshold > 0 and det_H < args.H_det_threshold:
+                    filtered_matches = []
                 print "%d matches after homography filter" % len(filtered_matches)
-            if args.f_threshold > 0:
+            if args.f_threshold > 0 and len(filtered_matches) > 4:
                 filtered_matches = feat.filter_matches_by_fundamental_matrix(
                         pattern_kp_mat,
                         fixed_kp_mat,
@@ -90,6 +94,9 @@ def main():
 
         # gather calibration data
         tmp = [(x,y) for (x,y) in zip(homo_matches, homo_keys) if len(x) >= args.min_matches]
+
+
+        print "using %d frames for calibration after pruning bad frames" % len(tmp)
         tmp = [calib.keypoint_matches_to_calibration_data(m, pattern_kp_mat, k) \
                 for (m,k) in tmp]
         [obj_pts, img_pts] = zip(*tmp)
@@ -102,11 +109,18 @@ def main():
             # homography filtering next iteration
             fixed_kp_mats = []
             for kp_mat in frame_kp_mats:
+                
                 tmp = np.reshape(kp_mat, (-1, 1, 2))
-                tmp = cv2.undistortPoints(tmp, K, distortion, P=K)
+                if kp_mat.shape[0] == 0:
+                    tmp = kp_mat
+                else:
+                    tmp = cv2.undistortPoints(tmp, K, distortion, P=K)
+
                 fixed_kp_mats.append(np.reshape(tmp, (-1, 2)))
      
-    map(lambda (fname, m): feat.write_matches(fname, m), zip(out_match_fnames, homo_matches))
+    out_matchset = [x if len(x) >= args.min_matches else [] for x in homo_matches]
+    assert(len(out_match_fnames) == len(out_matchset))
+    map(lambda (fname, m): feat.write_matches(fname, m), zip(out_match_fnames, out_matchset))
 
     cam = calib.Intrinsic_camera()
     cam.K = K

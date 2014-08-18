@@ -1,0 +1,1 @@
+for cam_i in {4..5}; do ./match_and_calibrate.py ../runs/iniital_test/out/pattern.key 250 ../runs/iniital_test/out/frames/${cam_i}-%d.key `ls -1 ../runs/iniital_test/images/frames/${cam_i}-*.png | head -1` ../runs/iniital_test/out/frames/${cam_i}-%d.match calib${cam_i}.intr --homography_threshold 5 --num_iterations 5; done

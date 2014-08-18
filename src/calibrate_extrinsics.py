@@ -32,7 +32,7 @@ def parse_args():
     parser.add_argument('out_bal_file', type=str, help='output file to pass to ceres-solver (follows format from paper, "Bundle Adjustment in the Large")')
     parser.add_argument('--min_matches', type=int, default=5, help='minimum number of matches between cameras for a frame to be accepted')
     parser.add_argument('--min_visible', type=int, default=3, help='minimum number of views for a point to be accepted')
-    parser.add_argument('--sparse_files', action='store_true', help='minimum number of views for a point to be accepted')
+    parser.add_argument('--sparse_files', action='store_true', help='allow missing files')
 
     return parser.parse_args()
       
@@ -102,7 +102,7 @@ def calibrate_pair(pattern_keys, data_1, data_2, min_matches):
         keys1 = [keys1[I[k]] for k in K]
         keys2 = [keys2[J[k]] for k in K]
         if(len(matches1)  == 0):
-            print "Error: No overlapping frames between views %d and %d -- double check 'order' parameter" % (cam1, cam2)
+            print "Error: No overlapping frames between views %d and %d -- double check 'order' parameter" % (cam_ind1+1, cam_ind2+1)
             exit(1)
 
     # prune non-mutual matches
@@ -207,20 +207,21 @@ def multi_triangulate(cams, pts, views, max_iter=1, stop_epsilon=1e-6):
         prev_weights,weights = weights,prev_weights
     return out
 
-def group_and_triangulate_matches(cams, num_pts, keys, matches, frames_indices, min_visible):
+def group_and_triangulate_matches(cams, num_pts, cams_keys_mat, matches, frame_indices, min_visible):
     """
     group mutually matching points and triangulate them.  
     """
     cam_mats = map(lambda x: x.to_mat(), cams)
     num_cams = len(cams)
-    assert(num_cams == len(keys))
+    assert(num_cams == len(cams_keys_mat))
     assert(num_cams == len(matches))
 
     num_frames = len(matches[0])
-    assert(len(keys[0]) == num_frames)
+    assert(len(cams_keys_mat[0]) == num_frames)
 
     all_pts3d = []
     all_pt_matches = []
+
 
     # for each frame, which cameras are present?
     if frame_indices[0] is None:
@@ -232,17 +233,17 @@ def group_and_triangulate_matches(cams, num_pts, keys, matches, frames_indices, 
         assert(len(frame_indices) == num_cams)
         frame_cams = [list() for _ in range(0, num_frames)]
 
-        for cam_i in range(0, num_frames):
+        for cam_i in range(0, num_cams):
             for fi in frame_indices[cam_i]:
                 frame_cams[fi].append(cam_i)
 
     for frame_i in range(0, num_frames):
+        pt_matches = [[] for x in range(0, num_pts)]
         # gather matches in all cameras
         for cam_i in frame_cams[frame_i]:
             cur_matches = matches[cam_i][frame_i]
-            print len(cur_matches) 
             for m in cur_matches:
-                pt = keys[cam_i][frame_i][m.trainIdx,:]
+                pt = cams_keys_mat[cam_i][frame_i][m.trainIdx,:]
                 pt_matches[m.queryIdx].append((cam_i, pt))
 
         pt_matches = [x for x in pt_matches if len(x) >= min_visible]
@@ -262,19 +263,94 @@ def group_and_triangulate_matches(cams, num_pts, keys, matches, frames_indices, 
 
     return all_pt_matches,all_pts3d
 
-def write_bal_file(fname, cams, matches, pts3d):
+# convert from opencv coordinates to ceres-solver coordinate conventions
+# (centered image coordiantes, y pointing upward, camera looking in negative-z direction)
+def prep_bal_data(cam, frames_keypoints):
+    xfm = np.eye(3)
+
+    K = cam.intrinsic.K
+    R = cam.R
+    T = cam.T
+
+    x0 = K[0,2]
+    y0 = K[1,2]
+    xfm[0,2] = -x0
+    xfm[1,2] = -y0
+
+    fx = K[0,0]
+    fy = K[1,1]
+    f_ = (fx + fy)/2.0
+
+    xfm[0,:] *= f_ / fx
+    xfm[1,:] *= f_ / fy
+
+    assert(abs(K[2,2] - 1.0) < 1e-7);
+    assert(abs(K[2,1]) < 1e-7);
+    assert(abs(K[2,0]) < 1e-7);
+    assert(abs(K[1,0]) < 1e-7);
+    assert(abs(K[0,1]) < 1e-7);
+    K = np.dot(xfm, K)
+    assert(abs(K[0,0] - f_) < 1e-7);
+    assert(abs(K[1,1] - f_) < 1e-7);
+    print abs(K[0,2])
+    assert(abs(K[0,2]) < 1e-7);
+    print abs(K[1,2])
+    assert(abs(K[1,2]) < 1e-7);
+
+    # flip image coordinate y
+    K[1,:] *= -1;
+
+    # flip camera coordinate y and z
+    K[:, 1] *= -1;
+    K[:, 2] *= -1;
+    R[1, :] *= -1;
+    R[2, :] *= -1;
+    T[1, 0] *= -1;
+    T[2, 0] *= -1;
+
+    # flip world coordinate y and z
+    R[:, 1] *= -1;
+    R[:, 2] *= -1;
+
+    cam.intrinsic.K = K
+    cam.R = R
+    cam.T = T
+
+    # center image point coordinates 
+    # and flip y
+
+    new_frames_keypoints = []
+    for keys in frames_keypoints:
+        if keys.size == 0:
+            new_frames_keypoints.append([])
+            continue
+
+        assert(keys.shape[1] == 2)
+        N = keys.shape[0]
+        tmp = np.dot(xfm, np.vstack([keys.T, np.ones((1, N))]))
+        tmp = tmp[0:2, :] / tmp[2,None]
+        print tmp.shape
+        print tmp[0:2, :].shape
+        print tmp
+        print tmp.shape
+        tmp[1,:] = -tmp[1,:]
+        new_frames_keypoints.append(tmp.T)
+    return (cam, new_frames_keypoints, xfm)
+
+
+def write_bal_file(fname, cams, pts_matches, pts3d):
     """
     write to a text file following the format from
     "Bundle Adjustment in the Large" Argawal, et al.
     http://grail.cs.washington.edu/projects/bal/
     """
-    assert(len(matches) == len(pts3d))
+    assert(len(pts_matches) == len(pts3d))
     
-    num_observations = sum([len(x) for x in matches])
-    f = open(fname)
+    num_observations = sum([len(x) for x in pts_matches])
+    f = open(fname, 'w')
     assert(f is not None)
 
-    f.write("%d %d %d\n" % len(cams), len(pts3d), num_observations)
+    f.write("%d %d %d\n" % (len(cams), len(pts3d), num_observations))
 
     for i, pt_matches in enumerate(pts_matches):
         for m in pt_matches:
@@ -283,17 +359,18 @@ def write_bal_file(fname, cams, matches, pts3d):
             f.write("%d %d %f %f\n" % (cam_index, i, pt[0], pt[1]))
 
     for c in cams:
-        R = cv2.Rodrigues(c.R)
+        R = cv2.Rodrigues(c.R)[0]
         T = c.T
-        f = (c.intr.K[0,0] + c.intr.K[1,1])/2
-        k1 = c.intr.distortion[0]
-        k2 = c.intr.distortion[1]
-        f.write("%d %d %d " % (R[0], R[1], R[2]))
-        f.write("%d %d %d " % (T[0], T[1], T[2]))
-        f.write("%d %d %d\n" % (f, k1, k2))
+        f_ = (c.intrinsic.K[0,0] + c.intrinsic.K[1,1])/2
+        k1 = c.intrinsic.distortion[0]
+        k2 = c.intrinsic.distortion[1]
+        print R
+        f.write("%f %f %f " % (R[0,0], R[1,0], R[2,0]))
+        f.write("%f %f %f " % (T[0,0], T[1,0], T[2,0]))
+        f.write("%f %f %f\n" % (f_, k1, k2))
 
     for pt in pts3d:
-        f.write("%d %d %d\n" % (pt[0], pt[1], pt[2]))
+        f.write("%f %f %f\n" % (pt[0], pt[1], pt[2]))
     f.close()
 
 def get_config_tree(config_str):
@@ -320,6 +397,9 @@ def main():
 
         print "Reading keys"
         [keys, I_keys] = read_keys(args.num_cams, args.num_frames, args.keys_fmt, args.sparse_files)
+        if any([len(x) == 0 for x in keys]):
+            print "No key files found for at least one view"
+            exit(1)
 
         print "Reading matches"
         [matches, I_matches] = read_matches(args.num_cams, args.num_frames, args.matches_fmt, args.sparse_files)
@@ -331,17 +411,20 @@ def main():
         else:
             frame_indices = I_keys
 
-        pickle.dump((pattern_keys, intrinsic_cams, keys, matches, frame_indices), open("debug.p", 'wb'))
+#        pickle.dump((pattern_keys, intrinsic_cams, keys, matches, frame_indices), open("debug.p", 'wb'))
+
+        config_tree = get_config_tree(args.camera_configuration)
+
+        cams = pairwise_calib(pattern_keys, intrinsic_cams, keys, matches, frame_indices, config_tree, args.min_matches)
+        pickle.dump((pattern_keys, intrinsic_cams, keys, matches, frame_indices, config_tree, cams), open("debug2.p", 'wb'))
     else:
-        (pattern_keys, intrinsic_cams, keys, matches, frame_indices) = pickle.load(open("debug.p", 'rb'))
+        (pattern_keys, intrinsic_cams, keys, matches, frame_indices, config_tree, cams) = pickle.load(open("debug2.p", 'rb'))
 
-    config_tree = get_config_tree(args.camera_configuration)
-    print config_tree.to_string()
-
-    cams = pairwise_calib(pattern_keys, intrinsic_cams, keys, matches, frame_indices, config_tree, args.min_matches)
+    tmp = [prep_bal_data(cam, cam_keys) for (cam, cam_keys) in zip(cams, keys)]
+    [cams, keys, xfms] = zip(*tmp)
 
     [grouped_matches, pts3d] = group_and_triangulate_matches(cams, len(pattern_keys), keys, matches, frame_indices, args.min_visible)
-    write_bal_file(args.out_fname, cams, grouped_matches, pts3d)
+    write_bal_file(args.out_bal_file, cams, grouped_matches, pts3d)
 
 
 if __name__ == "__main__":

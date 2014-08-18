@@ -19,7 +19,7 @@ def main():
     matches = match_features(desc1, desc2, args.lowe_threshold)
 
     if args.homography_threshold > 0:
-        matches = filter_matches_by_homography(kp1, kp2, matches, args.homography_threshold)
+        [matches, H] = filter_matches_by_homography(kp1, kp2, matches, args.homography_threshold)
 
     write_matches(args.out_fname, matches)
     read_matches(args.out_fname)

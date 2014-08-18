@@ -4,7 +4,7 @@ import numpy as np
 def read_features(in_fname):
     infile = open(in_fname, 'r')
     if infile is None:
-        return None
+        return ([], [])
     tokens = infile.readline().split()
     assert(len(tokens) == 2)
     num_pts = int(tokens[0])
@@ -37,6 +37,12 @@ def read_features(in_fname):
 def write_features(out_fname, kps, descs):
     outfile = open(out_fname, 'w')
     num_pts = len(kps)
+    if num_pts == 0:
+        line = "0 128\n" 
+        outfile.write(line)
+        outfile.close()
+        return
+
     num_dims = descs.shape[1]
     assert(descs.shape[0] == num_pts)
 
@@ -70,6 +76,9 @@ def extract_features(fname, use_surf=True, upright=False):
     return (kp, desc)
 
 def match_features(desc1, desc2, lowe_ratio=0.6):
+    if desc1.shape[0] == 0 or desc2.shape[0] == 0:
+        return []
+
     if desc1.shape[1] != desc2.shape[1]:
         raise Exception("incompatible feature vector dimensions")
 
@@ -113,7 +122,8 @@ def filter_matches_by_homography(key_pts1, key_pts2, matches, threshold):
     [H, mask] = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, threshold)
 
     mask = np.nonzero(np.reshape(mask, (-1)))[0]
-    return [matches[i] for i in mask]
+    return ([matches[i] for i in mask], H)
+
 def read_matches(fname):
     f = open(fname, 'r')
     if f is None:
